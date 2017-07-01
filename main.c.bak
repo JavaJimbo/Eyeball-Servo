@@ -1,0 +1,347 @@
+//  RC Servo - For PIC 18F1330 using MPLABX
+//  For the RC Servo Board
+// 
+//  6/24/10  	Got PWM period set to 2 milliseconds for RC servos.
+//  9/3/10   	Cleaned up, eliminated unnecesary variables. Check robot ID# in interrupt routine.
+//  2/17/12  	New version, ASCII protocol.
+//  02-04-2013	Compiles with High Tech - gives boring COFF error.
+//  02-05-2013	Communicates using XBEE at 115200 baud.
+// 		Reads pot, controls duty cycle.
+//		Works with Animator.
+//  2-7-2013    Got rid of MIDI stuff; simplified board enabling
+//  5-3-2013	Removed decoding, changed baud rate to 19200 to work with Memory board bit banged input.
+//		TODO: Check over interupt routine.
+//  6-7-14      
+
+#include <plib.h>
+#include "DELAY16.H"
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h> 
+#include <math.h>
+#include "DELAY16.H"
+
+#define BOARD_ID 3
+#define ANY_BOARD 0xFF
+
+#define TESTout PORTBbits.RB2
+
+#define STX 2
+#define ETX 3
+#define DLE 6
+#define PLUS  43
+#define ROBOT_ID 1
+#define MAXBUFFER 64
+
+#define THIS_BOARD_NUMBER 0x81
+#define SETBOARD 0x80
+
+#define LED PORTAbits.RA4
+
+#define false 0
+#define true !false
+#define TRUE true
+#define FALSE false
+
+unsigned int convertDutyCycle(unsigned char servoPosition);
+void initializePorts(void);
+void putch(unsigned char byte);
+int readAD(void);
+void ADsetChannel(unsigned char channel);
+void initializePorts(void);
+void putch(unsigned char ch);
+
+unsigned char dummy, ch, testCommand = SETBOARD, myboardNumber = THIS_BOARD_NUMBER, boardNumber = 0;
+static unsigned int j = 0;
+static unsigned char startFlag = false, endFlag = false, escapeFlag = false, LEDflag = false;
+static unsigned char LEDcounter = 10;
+
+unsigned int dutyCycle[6] = {288, 288, 288, 288, 288, 288};
+
+union {
+    unsigned char byte[2];
+    unsigned int val;
+} integer;
+
+
+#define MAXDATA 64
+unsigned char INbuffer[MAXBUFFER];
+unsigned char INlength = 0;
+unsigned char HOSTbuffer[MAXDATA];
+
+#define MAXDUTY 288 * 2
+#define MINDUTY 288
+
+// Configuration: High speed crystal (HS) oscillator, 
+#pragma config OSC=HS, FCMEN=OFF, IESO=OFF,\
+PWRT=OFF, BOR=OFF, BORV=3,\
+WDT=OFF, WDTPS=32768, PWMPIN=ON, LPOL=LOW, HPOL=HIGH,\
+FLTAMX=RA5, T1OSCMX=HIGH, MCLRE=ON,\
+STVREN=ON, BBSIZ=BB256,\
+CP0=OFF, CP1=OFF, CPB=OFF, CPD=OFF,\
+WRT0=OFF, WRT1=OFF, WRTC=OFF, WRTB=OFF, WRTD=OFF,\
+EBTR0=OFF, EBTR1=OFF, EBTRB=OFF
+
+void main(void) {
+    unsigned char LEDflag = false;
+    unsigned char counter=0;
+
+    initializePorts();
+    DelayMs(100);
+    printf("RC Servo Board pot test  \r");
+    ADsetChannel(0);
+    LED = 0;
+
+    while (1) {
+
+        if (PIR3bits.PTIF) {
+            PIR3bits.PTIF = 0;
+
+        }
+
+        if (INlength) {
+            dutyCycle[0] = convertDutyCycle(INbuffer[3]);
+            dutyCycle[1] = convertDutyCycle(INbuffer[4]);
+            dutyCycle[2] = convertDutyCycle(INbuffer[5]);
+            dutyCycle[3] = convertDutyCycle(INbuffer[6]);
+            dutyCycle[4] = convertDutyCycle(INbuffer[7]);
+            dutyCycle[5] = convertDutyCycle(INbuffer[8]);
+            INlength = 0;
+        }
+
+        if (TMR1IF) {
+            TMR1IF = 0;
+            if (counter)counter--;
+            if (!counter){
+                printf("\r%d, %d, %d, %d,  %d, %d, %d, %d", INbuffer[3], INbuffer[4], INbuffer[5], INbuffer[6], INbuffer[7], INbuffer[8], INbuffer[9], INbuffer[10]);
+            }
+
+            if (OVDCOND == 0b00010101)
+                OVDCOND = 0b00101010;
+            else
+                OVDCOND = 0b00010101;
+            if (OVDCOND == 0b00010101) {
+                integer.val = dutyCycle[0];
+                PDC0L = integer.byte[0];
+                PDC0H = integer.byte[1];
+
+                integer.val = dutyCycle[2];
+                PDC1L = integer.byte[0];
+                PDC1H = integer.byte[1];
+
+                integer.val = dutyCycle[4];
+                PDC2L = integer.byte[0];
+                PDC2H = integer.byte[1];
+            } else {
+                integer.val = dutyCycle[1];
+                PDC0L = integer.byte[0];
+                PDC0H = integer.byte[1];
+
+                integer.val = dutyCycle[3];
+                PDC1L = integer.byte[0];
+                PDC1H = integer.byte[1];
+
+                integer.val = dutyCycle[5];
+                PDC2L = integer.byte[0];
+                PDC2H = integer.byte[1];
+            }
+            PTEN = 1;
+        }
+    }
+}
+
+unsigned int convertDutyCycle(unsigned char servoPosition) {
+    unsigned int temp;
+
+    temp = servoPosition;
+    temp = temp * 9;
+    temp = temp / 8;
+    temp = temp + 288;
+    return (temp);
+}
+
+void initializePorts(void) {
+    unsigned char dummy;
+
+
+    INTCON = 0x00; // First, clear all interrupts
+    PIE1 = 0; // Clear all peripheral interrupts
+
+    // Initialize ports
+    ADCON0 = 0b00000000; // Turn off A/D for now.
+    ADCON1 = 0b000001110; // Set up 18F1330 for one analog input, use VCC and VSS for references.
+    ADCON2 = 0b01111111; // Use FRC internal oscillator for A/D clock, left justified result
+
+
+    TRISA = 0b00001111; // Port A
+    TRISB = 0b00000000; // Port B
+    RBPU = 0; // Enable Port B pullups
+
+    // Set up Timer 0 for 444 uS interrupts
+    T0CON = 0x00; // Clear everything
+    T016BIT = 1; //
+    PSA = 0; // Use prescaler
+    T0PS0 = 0; // 1:8 prescaler
+    T0PS1 = 1;
+    T0PS2 = 0;
+    T0CS = 0; // Use clock input
+    T0SE = 0; // Not used
+    TMR0ON = 1; // Enable counter.
+
+    // Set up Timer 1
+    T1CON = 0; // Clear
+    T1RD16 = 1; // Enable 16 bit operation.
+    TMR1CS = 0; // Use internal clock
+    T1CKPS0 = 0; // 1:1 prescale
+    T1CKPS1 = 0;
+    TMR1ON = 1; // Let her rip
+
+    // Set up the PWM outputs
+    PIE3 = 0;
+    FLTCONFIG = 0; // Disable faults
+
+    PTCON0 = 0b00000000;
+    PTCKPS0 = 1; // 1:64 Prescale
+    PTCKPS1 = 1;
+
+    PTMOD1 = 0; // Single shot mode
+    PTMOD0 = 1;
+
+
+    PTCON1 = 0b10000000; // PWM time base one. Count upwards
+
+    //PWMCON0 = 0b00100111;	// PWM0 & PWM1 pin enabled, all outputs independent mode
+    PWMCON0 = 0x00;
+    PWMEN0 = 0; // Enable all PWM outputs
+    PWMEN1 = 0;
+    PWMEN2 = 1;
+    PMOD0 = 1; // All PWM's in independent mode
+    PMOD1 = 1; // All PWM's in independent mode
+    PMOD2 = 1; // All PWM's in independent mode
+
+    //	PWMCON1 = 0b11110000;
+    PWMCON1 = 0; // irrlelevant
+
+    PTPERH = 0; // Set PWM period to a little > 2 milliseconds.
+    PTPERL = 150;
+
+    PDC0L = 0b00000000;
+    PDC0H = 0b00000000;
+    PDC1L = 0b00000000;
+    PDC1H = 0b00000000;
+    PDC2L = 0b00000000;
+    PDC2H = 0b00000000;
+
+    OVDCOND = 0b00101010; // Set outputs on PWM0, PWM2, PWM4
+    OVDCONS = 0b00000000; // When PWM's are off, keep outputs low.
+
+    //	PDC0L =  32;
+    //	PDC0H = 1;
+
+    BRGH = 1; // high speed baud rate
+    //SPBRG = 59;		// set the baud rate to 19,200 for 18.432 Mhz clock
+    SPBRG = 19; // Set the baud rate to 57600 for 18.432 Mhz clock
+    //SPBRG = 9;	// set the baud rate to 115,200 for 18.432 Mhz clock
+
+    SYNC = 0; // asynchronous
+    SPEN = 1; // enable serial port pins
+    CREN = 1; // enable reception
+    SREN = 0; // no effect
+    TXIE = 0; // disable tx interrupts
+    RCIE = 1; // Enable rx interrupts
+    TX9 = 0; // 8- or 9-bit transmission
+    RX9 = 0; // 8- or 9-bit reception
+    TXEN = 1; // enable the transmitter
+
+
+    TXIE = 0; // Disable UART Tx interrupts
+    RCIE = 1; // Enabled UART Rx interrupts
+
+    PEIE = 1; // Enable peripheral interrupts.
+    TMR1IE = 0; // Disable timer 1 interrupts.
+    TMR0IE = 0; // Disable Timer 0 interrupts
+    GIE = 1; // Enable global interrupts
+}
+
+
+// This transmits one character over the RS485 bus.
+// It enables RS485 transmission for the first character sent,
+// and disables if a carriage return '\r' is tranmitted.
+
+void putch(unsigned char ch) {
+    while (!TXIF) // Wait for transmit buffer to be empty
+        continue;
+    TXREG = ch;
+}
+
+void ADsetChannel(unsigned char channel) {
+    ADCON0 = (channel << 2) + 0x01; // enable ADC, RC osc.
+}
+
+int readAD(void) {
+    int ADresult;
+    GODONE = 1;
+    while (GODONE)
+        continue; // wait for conversion complete
+    ADresult = (int) ADRESH;
+
+    return (ADresult);
+}
+
+static void interrupt
+isr(void) {
+    unsigned char BoardID, ch;
+    static unsigned char j = 0;
+    static unsigned char escapeFlag = false;
+    static unsigned char counter = 0;
+
+    if (RCIF == 1) { // If RX interrupt occurs:
+        RCIF = 0;
+
+        if (RCSTAbits.OERR) { // If overrun occurs, reset receive enable.
+            RCSTAbits.CREN = 0;
+            RCSTAbits.CREN = 1;
+        }
+
+        if (RCSTAbits.FERR) // If frame error occurs, flush buffer
+            ch = RCREG;
+        ch = RCREG;
+
+        // If preceding character wasn't an escape char,
+        // check whether it is STX, ETX or DLE,
+        // otherwise if board number matches then store and advance for next char
+        if (escapeFlag == false) {
+            if (ch == DLE) escapeFlag = true;
+            else if (ch == STX) {
+                j = 0;
+            } else if (ch == ETX) {
+                BoardID = HOSTbuffer[2];                
+                if (BoardID == BOARD_ID || BoardID == ANY_BOARD) {
+                    if (counter)counter--;
+                    if (!counter) {
+                        counter = 10;
+                        if (LEDflag) {
+                            LEDflag = false;
+                            LED=1;
+                        } else {
+                            LEDflag = true;
+                            LED=0;
+                        }
+                        INlength = j;
+                        for (j = 0; j < MAXBUFFER; j++)
+                            INbuffer[j] = HOSTbuffer[j];
+                        j = 0;
+                    }
+                }
+            } else if (j < MAXBUFFER) HOSTbuffer[j++] = ch;
+            else j = 0;
+        } else {
+            escapeFlag = false;
+            if (j < MAXBUFFER) HOSTbuffer[j++] = ch;
+        }
+    }
+}
+
